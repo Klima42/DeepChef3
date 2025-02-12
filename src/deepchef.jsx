@@ -1,6 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Camera, Loader2, X, Send, Utensils, MessageSquare } from 'lucide-react';
+import { toast } from 'react-hot-toast';
 
 const DeepChef = () => {
   const [isOpen, setIsOpen] = useState(true);
@@ -17,50 +18,61 @@ const DeepChef = () => {
   const handleImageUpload = (event) => {
     const file = event.target.files[0];
     if (file) {
+      if (file.size > 5 * 1024 * 1024) { // 5MB limit
+        toast.error('Image size should be less than 5MB');
+        return;
+      }
       setImageFile(file);
       const reader = new FileReader();
       reader.onloadend = () => {
         setImagePreview(reader.result);
+      };
+      reader.onerror = () => {
+        toast.error('Failed to read image file');
       };
       reader.readAsDataURL(file);
     }
   };
 
   const processUserRequest = async (params) => {
-    if (params.imageFile) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-          try {
-            const base64Data = reader.result.split(',')[1];
-            const response = await fetch('/.netlify/functions/process-request', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                imageFile: base64Data,
-              }),
-            });
-            
-            if (!response.ok) {
-              throw new Error(`HTTP error! status: ${response.status}`);
+    try {
+      if (params.imageFile) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = async () => {
+            try {
+              if (!reader.result) {
+                throw new Error('Failed to read image file');
+              }
+              
+              const base64Data = reader.result.split(',')[1];
+              const response = await fetch('/.netlify/functions/process-request', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  imageFile: base64Data,
+                }),
+              });
+              
+              if (!response.ok) {
+                throw new Error(`Request failed with status ${response.status}`);
+              }
+              
+              const data = await response.json();
+              if (data.error) {
+                throw new Error(data.error);
+              }
+              resolve(data);
+            } catch (error) {
+              reject(error);
             }
-            
-            const data = await response.json();
-            if (data.error) {
-              throw new Error(data.error);
-            }
-            resolve(data);
-          } catch (error) {
-            reject(error);
-          }
-        };
-        reader.onerror = () => reject(new Error('Failed to read file'));
-        reader.readAsDataURL(params.imageFile);
-      });
-    } else if (params.currentMessage) {
-      try {
+          };
+          reader.onerror = () => reject(new Error('Failed to read file'));
+          reader.readAsDataURL(params.imageFile);
+        });
+      } else if (params.currentMessage) {
         const response = await fetch('/.netlify/functions/process-request', {
           method: 'POST',
           headers: {
@@ -72,7 +84,7 @@ const DeepChef = () => {
         });
         
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(`Request failed with status ${response.status}`);
         }
         
         const data = await response.json();
@@ -80,55 +92,61 @@ const DeepChef = () => {
           throw new Error(data.error);
         }
         return data;
-      } catch (error) {
-        throw error;
       }
+      throw new Error('No valid input provided');
+    } catch (error) {
+      console.error('Process request error:', error);
+      throw error;
     }
   };
 
   const handleSubmit = async () => {
+    if (loading || (!imageFile && !currentMessage.trim())) {
+      return;
+    }
+
     setLoading(true);
     setError('');
     setChefAsked(false);
+
     try {
       const requestData = {};
       if (imageFile) {
         requestData.imageFile = imageFile;
-      } else if (currentMessage) {
-        requestData.currentMessage = currentMessage;
+      } else if (currentMessage.trim()) {
+        requestData.currentMessage = currentMessage.trim();
       }
 
       const response = await processUserRequest(requestData);
-
-      if (response.error) {
-        setError(response.error);
-      } else {
-        if (response.ingredients) {
-          setIngredients(response.ingredients);
-        }
-        if (response.recipes) {
-          setRecipes(response.recipes);
-        }
-        setCurrentMessage('');
-        setImageFile(null);
-        setImagePreview('');
+      
+      if (response.ingredients) {
+        setIngredients(response.ingredients);
       }
+      if (response.recipes) {
+        setRecipes(response.recipes);
+      }
+      setCurrentMessage('');
+      setImageFile(null);
+      setImagePreview('');
     } catch (err) {
-      setError('Failed to process request. Please try again.');
-      console.error('Error processing request:', err);
+      const errorMessage = err.message || 'Failed to process request. Please try again.';
+      setError(errorMessage);
+      toast.error(errorMessage);
     } finally {
       setLoading(false);
     }
   };
 
   const askChef = async (recipe) => {
+    if (loading) return;
+    
     setLoading(true);
     try {
-      let prompt = `Hey Chef, how do I cook this? Recipe Title: ${recipe.title}.\n`;
-      prompt += `I have these ingredients: ${ingredients.join(', ')}.`;
-      if (recipe.missedIngredientCount > 0) {
-        prompt += `\nI'm missing ${recipe.missedIngredientCount} ingredients.`;
-      }
+      const prompt = `Hey Chef, how do I cook this? Recipe Title: ${recipe.title}.\n` +
+                    `I have these ingredients: ${ingredients.join(', ')}.` +
+                    (recipe.missedIngredientCount > 0 
+                      ? `\nI'm missing ${recipe.missedIngredientCount} ingredients.`
+                      : '');
 
       const systemPrompt = `You are Auguste, a Michelin-star chef. A user has requested detailed instructions for the following recipe: "${recipe.title}". They have indicated they possess the following ingredients: ${ingredients.join(', ')}. They are missing ${recipe.missedIngredientCount} ingredients from the Spoonacular suggestion.
 
@@ -160,23 +178,25 @@ Provide a *complete and highly detailed* recipe, formatted as follows:
         body: JSON.stringify({ messages: aiMessages })
       });
 
-      if (!response.ok) throw new Error('API request failed');
+      if (!response.ok) {
+        throw new Error('Failed to get recipe instructions');
+      }
 
       const data = await response.json();
       const aiResponse = `${data.content}\n\n_— ChefGPT_`;
 
-      const detailedRecipe = {
-        ...recipe,
-        detailedInstructions: aiResponse
-      };
-
       setRecipes(prevRecipes =>
-        prevRecipes.map(r => (r.id === recipe.id ? detailedRecipe : r))
+        prevRecipes.map(r => 
+          r.id === recipe.id 
+            ? { ...r, detailedInstructions: aiResponse }
+            : r
+        )
       );
       setChefAsked(true);
-
     } catch (error) {
-      setError("⚠️ Hmm, I'm having trouble connecting. Please try again later!");
+      const errorMessage = "Failed to get chef's instructions. Please try again.";
+      setError(errorMessage);
+      toast.error(errorMessage);
       console.error('Error asking chef:', error);
     } finally {
       setLoading(false);
@@ -209,7 +229,8 @@ Provide a *complete and highly detailed* recipe, formatted as follows:
               <div className="flex flex-col items-center gap-2">
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  className="flex items-center gap-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600"
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                  disabled={loading}
                 >
                   <Camera className="w-4 h-4" />
                   Upload Food Image
@@ -228,14 +249,17 @@ Provide a *complete and highly detailed* recipe, formatted as follows:
                   <img
                     src={imagePreview}
                     alt="Food Preview"
-                    className="max-h-48 rounded-lg"
+                    className="max-h-48 rounded-lg object-cover"
                   />
                   <button
                     onClick={() => {
                       setImagePreview('');
                       setImageFile(null);
+                      if (fileInputRef.current) {
+                        fileInputRef.current.value = '';
+                      }
                     }}
-                    className="absolute top-2 right-2 p-1 bg-red-500 text-white rounded-full hover:bg-red-600"
+                    className="absolute top-2 right-2 p-1 bg-red-500 text-white rounded-full hover:bg-red-600 transition-colors"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -247,17 +271,18 @@ Provide a *complete and highly detailed* recipe, formatted as follows:
                   value={currentMessage}
                   onChange={(e) => setCurrentMessage(e.target.value)}
                   placeholder="Or type your ingredients here..."
-                  className="flex-1 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all resize-none h-12 overflow-hidden"
+                  className="flex-1 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all resize-none h-12 overflow-hidden disabled:opacity-50"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
                       handleSubmit();
                     }
                   }}
+                  disabled={loading}
                 />
                 <motion.button
                   onClick={handleSubmit}
-                  disabled={loading || (!imageFile && !currentMessage)}
+                  disabled={loading || (!imageFile && !currentMessage.trim())}
                   className="p-3 bg-blue-500 rounded-lg text-white shadow-md hover:bg-blue-600 transition-colors disabled:opacity-50"
                   whileTap={{ scale: 0.95 }}
                 >
